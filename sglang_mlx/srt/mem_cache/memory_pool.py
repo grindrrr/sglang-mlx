@@ -241,45 +241,29 @@ class PooledKVCache:
             return None, None
         return self._pool.fetch(self._layer_idx, all_indices)
 
-    @staticmethod
     def make_mask(
+        self,
         N: int,
-        offset: int = 0,
         return_array: bool = False,
         window_size: int | None = None,
-    ) -> mx.array | None:
-        """Create attention mask matching mlx-lm's create_attention_mask contract.
+    ) -> mx.array | str | None:
+        """Create attention mask, delegating to mlx-lm's implementation.
+
+        Called by the model's attention layers via
+        ``base.create_attention_mask(h, cache)``.
 
         Args:
             N: Number of new query tokens.
-            offset: Number of already-cached tokens (prefix length).
-            return_array: If True, always return an array even for N=1.
+            return_array: If True and N > 1, return an explicit boolean mask
+                instead of the ``"causal"`` shorthand.
             window_size: Sliding window size (None = full attention).
 
         Returns:
-            None for single-token decode (no mask needed), or a causal mask array.
+            ``None`` for single-token decode, ``"causal"`` for standard prefill,
+            or a boolean ``mx.array`` mask for windowed / explicit cases.
         """
-        if N == 1 and not return_array:
-            return None
+        from mlx_lm.models.cache import create_attention_mask
 
-        # Total sequence length = cached prefix + new tokens
-        T = offset + N
-        # Causal mask: query position i can attend to key positions 0..offset+i
-        # Shape: (1, 1, N, T) for broadcasting with (1, H, N, D)
-        q_pos = mx.arange(offset, offset + N).reshape(N, 1)
-        k_pos = mx.arange(T).reshape(1, T)
-        mask = q_pos >= k_pos  # (N, T) boolean — True where attention is allowed
-
-        if window_size is not None:
-            window_mask = q_pos - k_pos < window_size
-            mask = mask & window_mask
-
-        # Convert to additive mask: 0 where allowed, -inf where blocked
-        mask = mx.where(
-            mask,
-            mx.array(0.0, dtype=mx.float32),
-            mx.array(float("-inf"), dtype=mx.float32),
+        return create_attention_mask(
+            N, offset=self.offset, return_array=return_array, window_size=window_size
         )
-        # Expand to (1, 1, N, T)
-        mask = mx.expand_dims(mask, axis=(0, 1))
-        return mask

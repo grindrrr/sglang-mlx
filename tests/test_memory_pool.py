@@ -283,55 +283,64 @@ class TestPooledKVCache:
 
     def test_mask_decode_returns_none(self):
         """Single-token decode should return None (no mask needed)."""
-        assert PooledKVCache.make_mask(N=1, offset=10) is None
+        pool = self._make_pool()
+        cache = PooledKVCache(pool, layer_idx=0)
+        cache.set_indices(prefix_indices=[1, 2, 3], new_indices=[4])
+        assert cache.make_mask(N=1) is None
 
     def test_mask_prefill_causal(self):
-        """Prefill mask should be causal."""
-        mask = PooledKVCache.make_mask(N=4, offset=0)
-        assert mask is not None
-        assert mask.shape == (1, 1, 4, 4)
-
-        # Convert to numpy for checking
-        m = np.array(mask[0, 0], copy=False)
-        # Upper triangle (above diagonal) should be -inf
-        for i in range(4):
-            for j in range(4):
-                if j <= i:
-                    assert m[i, j] == 0.0, f"Position ({i},{j}) should be 0"
-                else:
-                    assert m[i, j] == float("-inf"), (
-                        f"Position ({i},{j}) should be -inf"
-                    )
+        """Prefill without window returns 'causal' string (mlx-lm convention)."""
+        pool = self._make_pool()
+        cache = PooledKVCache(pool, layer_idx=0)
+        cache.set_indices(prefix_indices=[], new_indices=[1, 2, 3, 4])
+        mask = cache.make_mask(N=4)
+        assert mask == "causal"
 
     def test_mask_with_offset(self):
-        """Mask with offset (e.g., new tokens after cached prefix)."""
-        mask = PooledKVCache.make_mask(N=2, offset=3)
-        assert mask is not None
-        # N=2 query tokens, T=3+2=5 key positions
-        assert mask.shape == (1, 1, 2, 5)
-
-        m = np.array(mask[0, 0], copy=False)
-        # First query at position 3: can attend to positions 0..3
-        assert m[0, 3] == 0.0
-        assert m[0, 4] == float("-inf")
-        # Second query at position 4: can attend to all 5
-        assert m[1, 4] == 0.0
+        """Prefill after cached prefix returns 'causal' string."""
+        pool = self._make_pool()
+        cache = PooledKVCache(pool, layer_idx=0)
+        cache.set_indices(prefix_indices=[1, 2, 3], new_indices=[4, 5])
+        mask = cache.make_mask(N=2)
+        assert mask == "causal"
 
     def test_mask_with_window(self):
-        """Sliding window mask."""
-        mask = PooledKVCache.make_mask(N=3, offset=0, window_size=2)
-        assert mask is not None
-        m = np.array(mask[0, 0], copy=False)
+        """Sliding window mask returns a boolean array."""
+        pool = self._make_pool()
+        cache = PooledKVCache(pool, layer_idx=0)
+        cache.set_indices(prefix_indices=[], new_indices=[1, 2, 3])
+        mask = cache.make_mask(N=3, window_size=2)
+        assert isinstance(mask, mx.array)
+        assert mask.shape == (3, 3)
+        m = np.array(mask, copy=False)
         # Position 2 can attend to positions 1,2 (window=2) but not position 0
-        assert m[2, 0] == float("-inf")
-        assert m[2, 1] == 0.0
-        assert m[2, 2] == 0.0
+        assert not m[2, 0]
+        assert m[2, 1]
+        assert m[2, 2]
 
-    def test_mask_return_array_for_decode(self):
-        """return_array=True should return mask even for N=1."""
-        mask = PooledKVCache.make_mask(N=1, offset=5, return_array=True)
-        assert mask is not None
-        assert mask.shape == (1, 1, 1, 6)
+    def test_mask_return_array(self):
+        """return_array=True with N>1 returns explicit boolean mask."""
+        pool = self._make_pool()
+        cache = PooledKVCache(pool, layer_idx=0)
+        cache.set_indices(prefix_indices=[1, 2, 3], new_indices=[4, 5])
+        mask = cache.make_mask(N=2, return_array=True)
+        assert isinstance(mask, mx.array)
+        # Shape: (N, offset+N) = (2, 5)
+        assert mask.shape == (2, 5)
+        m = np.array(mask, copy=False)
+        # First query at position 3: can attend to positions 0..3
+        assert m[0, 3]
+        assert not m[0, 4]
+        # Second query at position 4: can attend to all 5
+        assert m[1, 4]
+
+    def test_mask_decode_with_return_array(self):
+        """N=1 with return_array=True still returns None (mlx-lm behavior)."""
+        pool = self._make_pool()
+        cache = PooledKVCache(pool, layer_idx=0)
+        cache.set_indices(prefix_indices=[1, 2, 3, 4, 5], new_indices=[6])
+        mask = cache.make_mask(N=1, return_array=True)
+        assert mask is None
 
     def test_state_property(self):
         """state property should return current cached KV."""

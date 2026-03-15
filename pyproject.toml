@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-mlx"
+version = "0.1.0"
+description = "SGLang-style LLM serving for Apple Silicon, built on MLX"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx>=0.22.0",
+    "mlx-lm>=0.22.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4.0",
+    "mdformat>=0.7.0",
+    "pre-commit>=3.0",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

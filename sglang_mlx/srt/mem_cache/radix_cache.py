@@ -22,6 +22,9 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from sglang_mlx.srt.mem_cache.paged_pool import BlockAllocator
+
 from sglang_mlx.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -44,7 +47,7 @@ from sglang_mlx.srt.mem_cache.evict_policy import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang_mlx.srt.mem_cache.memory_pool import TokenPoolAllocator
+    from sglang_mlx.srt.mem_cache.paged_pool import BlockAllocator
 
 
 class TreeNode:
@@ -113,7 +116,7 @@ class RadixCache(BasePrefixCache):
         else:
             raise ValueError(f"Unknown eviction policy: {self.eviction_policy}")
 
-        self.allocator: TokenPoolAllocator | None = None
+        self.allocator: BlockAllocator | None = None
         self.evictable_leaves: set[TreeNode] = set()
         self.reset()
 
@@ -126,7 +129,7 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self.evictable_leaves.clear()
 
-    def set_allocator(self, allocator: TokenPoolAllocator) -> None:
+    def set_allocator(self, allocator: BlockAllocator) -> None:
         """Attach a pool allocator so eviction frees slots back to it."""
         self.allocator = allocator
 

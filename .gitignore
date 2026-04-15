@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 # Virtual environments
+.venv/
 venv/
 .env/
 
@@ -11,3 +12,8 @@ venv/
 build/
 dist/
 *.egg-info/
+
+# Compiled extension artifacts
+**/*.so
+**/*.dylib
+**/*.metallib

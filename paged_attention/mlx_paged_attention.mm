@@ -1,3 +1,6 @@
+// This file is ported from EricB/kernels-paged-attention-metal (https://huggingface.co/EricB/kernels-paged-attention-metal)
+// Modified for MLX integration
+
 // mlx_paged_attention.mm
 // MLX primitives for paged_attention_v1 and paged_attention_v2.
 

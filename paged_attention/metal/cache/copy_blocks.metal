@@ -1,3 +1,6 @@
+// This file is ported from EricB/kernels-paged-attention-metal (https://huggingface.co/EricB/kernels-paged-attention-metal)
+// Modified for MLX integration
+
 #include "../utils.metal"
 #include <metal_stdlib>
 

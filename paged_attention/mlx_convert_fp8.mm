@@ -1,3 +1,6 @@
+// This file is ported from EricB/kernels-paged-attention-metal (https://huggingface.co/EricB/kernels-paged-attention-metal)
+// Modified for MLX integration
+
 // mlx_convert_fp8.mm
 // MLX primitive for FP8 format conversion.
 

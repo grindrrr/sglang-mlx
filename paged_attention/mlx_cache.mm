@@ -1,3 +1,6 @@
+// This file is ported from EricB/kernels-paged-attention-metal (https://huggingface.co/EricB/kernels-paged-attention-metal)
+// Modified for MLX integration
+
 // mlx_cache.mm
 // MLX primitives for cache operations: reshape_and_cache, copy_blocks, swap_blocks.
 

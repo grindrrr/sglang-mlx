@@ -1,3 +1,6 @@
+// This file is ported from EricB/kernels-paged-attention-metal (https://huggingface.co/EricB/kernels-paged-attention-metal)
+// Modified for MLX integration
+
 #pragma once
 #include <mlx/mlx.h>
 #include <optional>

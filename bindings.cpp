@@ -1,3 +1,6 @@
+// This file is ported from EricB/kernels-paged-attention-metal (https://huggingface.co/EricB/kernels-paged-attention-metal)
+// Modified for MLX integration
+
 // bindings.cpp — nanobind Python bindings for the paged-attention MLX extension.
 //
 // mx::array is a header-only type, so each .so gets a separate typeinfo address.

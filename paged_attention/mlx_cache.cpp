@@ -1,9 +1,6 @@
 // This file is ported from EricB/kernels-paged-attention-metal (https://huggingface.co/EricB/kernels-paged-attention-metal)
 // Modified for MLX integration
 
-// mlx_cache.mm
-// MLX primitives for cache operations: reshape_and_cache, copy_blocks, swap_blocks.
-
 #include "mlx_ops.h"
 #include <mlx/mlx.h>
 #include <mlx/primitives.h>
@@ -33,7 +30,6 @@ static std::string dtypeStr(mx::Dtype d) {
         case mx::float32:  return "float";
         case mx::float16:  return "half";
         case mx::bfloat16: return "bfloat16_t";
-        case mx::uint8:    return "uchar";
         default: throw std::invalid_argument("Unsupported cache dtype");
     }
 }
@@ -42,36 +38,29 @@ static std::string dtypeStr(mx::Dtype d) {
 
 struct ReshapeAndCache : mx::Primitive {
     std::string kernel_name_;
-    bool use_fp8_;
-    float k_scale_, v_scale_;
     int32_t num_heads_, head_size_, block_size_, x_;
 
     ReshapeAndCache(mx::Stream s, std::string kname,
-                    bool use_fp8, float k_scale, float v_scale,
                     int32_t num_heads, int32_t head_size,
                     int32_t block_size, int32_t x)
         : mx::Primitive(s), kernel_name_(std::move(kname)),
-          use_fp8_(use_fp8), k_scale_(k_scale), v_scale_(v_scale),
           num_heads_(num_heads), head_size_(head_size),
           block_size_(block_size), x_(x) {}
 
     const char* name() const override { return "ReshapeAndCache"; }
     bool is_equivalent(const mx::Primitive& o) const override {
         const auto& p = static_cast<const ReshapeAndCache&>(o);
-        return kernel_name_ == p.kernel_name_ && use_fp8_ == p.use_fp8_;
+        return kernel_name_ == p.kernel_name_;
     }
     void eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) override {
         throw std::runtime_error("ReshapeAndCache is GPU-only");
     }
 
-    // inputs: [key(0), value(1), key_cache(2), value_cache(3), slot_mapping(4)]
-    // outputs: [new_key_cache(0), new_value_cache(1)] — share buffer with inputs[2,3]
     void eval_gpu(const std::vector<mx::array>& inputs,
                   std::vector<mx::array>& outputs) override {
         auto& s = stream();
-        auto& d = mlx::core::metal::device(s.device);
+        auto& d = mx::metal::device(s.device);
 
-        // Share the existing cache buffers — the kernel only writes specific slots.
         outputs[0].copy_shared_buffer(inputs[2]);
         outputs[1].copy_shared_buffer(inputs[3]);
 
@@ -81,26 +70,17 @@ struct ReshapeAndCache : mx::Primitive {
 
         std::string lib_path = getModuleDirectory() + "/" METALLIB_PATH;
         auto* lib = d.get_library("paged_attention_mlx", lib_path);
-
-        bool use_fp8 = use_fp8_;
-        mlx::core::metal::MTLFCList fc = {
-            {&use_fp8, MTL::DataTypeBool, NS::UInteger(10)},
-        };
-        std::string hash = kernel_name_ + "_f" + (use_fp8_ ? "1" : "0");
-        auto* kernel = d.get_kernel(kernel_name_, lib, hash, fc);
+        auto* kernel = d.get_kernel(kernel_name_, lib);
 
         auto& enc = d.get_command_encoder(s.index);
         enc.set_compute_pipeline_state(kernel);
 
-        enc.set_input_array(inputs[0],  0);    // key (new tokens)
-        enc.set_input_array(inputs[1],  1);    // value (new tokens)
-        enc.set_output_array(outputs[0], 2);   // key_cache (in-place)
-        enc.set_output_array(outputs[1], 3);   // value_cache (in-place)
-        enc.set_input_array(inputs[4],  4);    // slot_mapping
-        if (use_fp8_) {
-            enc.set_bytes(k_scale_, 5);
-            enc.set_bytes(v_scale_, 6);
-        }
+        enc.set_input_array(inputs[0],  0);    // key
+        enc.set_input_array(inputs[1],  1);    // value
+        enc.set_output_array(outputs[0], 2);   // key_cache
+        enc.set_output_array(outputs[1], 3);   // value_cache
+        enc.set_input_array(inputs[4],  4);    // slot_mapping (MUST be int32)
+        
         enc.set_bytes(key_stride,   7);
         enc.set_bytes(value_stride, 8);
         enc.set_bytes(num_heads_,   9);
@@ -134,12 +114,10 @@ struct ReshapeAndCacheFlash : mx::Primitive {
         throw std::runtime_error("ReshapeAndCacheFlash is GPU-only");
     }
 
-    // inputs: [key(0), value(1), key_cache(2), value_cache(3), slot_mapping(4)]
-    // outputs: [new_key_cache(0), new_value_cache(1)]
     void eval_gpu(const std::vector<mx::array>& inputs,
                   std::vector<mx::array>& outputs) override {
         auto& s = stream();
-        auto& d = mlx::core::metal::device(s.device);
+        auto& d = mx::metal::device(s.device);
 
         outputs[0].copy_shared_buffer(inputs[2]);
         outputs[1].copy_shared_buffer(inputs[3]);
@@ -194,12 +172,10 @@ struct CopyBlocksLayer : mx::Primitive {
         throw std::runtime_error("CopyBlocksLayer is GPU-only");
     }
 
-    // inputs: [key_cache(0), value_cache(1), block_mapping(2)]
-    // outputs: [new_key_cache(0), new_value_cache(1)]
     void eval_gpu(const std::vector<mx::array>& inputs,
                   std::vector<mx::array>& outputs) override {
         auto& s = stream();
-        auto& d = mlx::core::metal::device(s.device);
+        auto& d = mx::metal::device(s.device);
 
         outputs[0].copy_shared_buffer(inputs[0]);
         outputs[1].copy_shared_buffer(inputs[1]);
@@ -211,9 +187,9 @@ struct CopyBlocksLayer : mx::Primitive {
         auto& enc = d.get_command_encoder(s.index);
         enc.set_compute_pipeline_state(kernel);
 
-        enc.set_output_array(outputs[0], 0);   // key_cache (in-place)
-        enc.set_output_array(outputs[1], 1);   // value_cache (in-place)
-        enc.set_input_array(inputs[2],   2);   // block_mapping [num_pairs, 2] int64
+        enc.set_output_array(outputs[0], 0);
+        enc.set_output_array(outputs[1], 1);
+        enc.set_input_array(inputs[2],   2);
         enc.set_bytes(numel_per_block_,  3);
 
         uint32_t tg_size = std::min<uint32_t>(256, numel_per_block_);
@@ -242,18 +218,12 @@ struct SwapBlocks : mx::Primitive {
         throw std::runtime_error("SwapBlocks is GPU-only");
     }
 
-    // inputs: [src(0), dst(1), block_mapping(2)]
-    // outputs: [new_dst(0)] — shares buffer with dst, has src blocks blitted in
     void eval_gpu(const std::vector<mx::array>& inputs,
                   std::vector<mx::array>& outputs) override {
         auto& s = stream();
-        auto& d = mlx::core::metal::device(s.device);
+        auto& d = mx::metal::device(s.device);
 
-        // Share dst's buffer; blit will overwrite specific blocks.
         outputs[0].copy_shared_buffer(inputs[1]);
-
-        // End any pending compute encoder before using blit encoder.
-        d.end_encoding(s.index);
 
         auto* cmd_buf = d.get_command_buffer(s.index);
         auto* blit    = cmd_buf->blitCommandEncoder();
@@ -261,7 +231,6 @@ struct SwapBlocks : mx::Primitive {
         auto* src_buf = static_cast<MTL::Buffer*>(const_cast<void*>(inputs[0].buffer().ptr()));
         auto* dst_buf = static_cast<MTL::Buffer*>(const_cast<void*>(outputs[0].buffer().ptr()));
 
-        // block_mapping is in unified memory — readable from CPU.
         const int64_t* bm = inputs[2].data<int64_t>();
         for (int64_t i = 0; i < num_pairs_; ++i) {
             NS::UInteger src_off = static_cast<NS::UInteger>(bm[i * 2    ] * block_size_bytes_);
@@ -278,12 +247,9 @@ struct SwapBlocks : mx::Primitive {
 std::vector<mx::array> reshape_and_cache(
     const mx::array& key, const mx::array& value,
     const mx::array& key_cache, const mx::array& value_cache,
-    const mx::array& slot_mapping,
-    const std::string& kv_cache_dtype,
-    float k_scale, float v_scale)
+    const mx::array& slot_mapping)
 {
     auto s = mx::default_stream(mx::Device::gpu);
-    bool use_fp8 = (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3");
     std::string kname = "reshape_and_cache_kv_"
         + dtypeStr(key.dtype()) + "_cache_" + dtypeStr(key_cache.dtype());
 
@@ -293,21 +259,19 @@ std::vector<mx::array> reshape_and_cache(
     int32_t x          = static_cast<int32_t>(key_cache.shape(4));
 
     auto prim = std::make_shared<ReshapeAndCache>(
-        s, kname, use_fp8, k_scale, v_scale, num_heads, head_size, block_size, x);
+        s, kname, num_heads, head_size, block_size, x);
 
     return mx::array::make_arrays(
         {key_cache.shape(), value_cache.shape()},
         {key_cache.dtype(), value_cache.dtype()},
         prim,
-        {key, value, key_cache, value_cache, slot_mapping});
+        {key, value, key_cache, value_cache, mx::astype(slot_mapping, mx::int32)});
 }
 
 std::vector<mx::array> reshape_and_cache_flash(
     const mx::array& key, const mx::array& value,
     const mx::array& key_cache, const mx::array& value_cache,
-    const mx::array& slot_mapping,
-    const std::string& kv_cache_dtype,
-    float k_scale, float v_scale)
+    const mx::array& slot_mapping)
 {
     auto s = mx::default_stream(mx::Device::gpu);
     std::string kname = "reshape_and_cache_flash_" + dtypeStr(key.dtype());
@@ -323,7 +287,7 @@ std::vector<mx::array> reshape_and_cache_flash(
         {key_cache.shape(), value_cache.shape()},
         {key_cache.dtype(), value_cache.dtype()},
         prim,
-        {key, value, key_cache, value_cache, slot_mapping});
+        {key, value, key_cache, value_cache, mx::astype(slot_mapping, mx::int32)});
 }
 
 std::pair<std::vector<mx::array>, std::vector<mx::array>> copy_blocks(
@@ -345,7 +309,7 @@ std::pair<std::vector<mx::array>, std::vector<mx::array>> copy_blocks(
     for (int64_t i = 0; i < num_layers; ++i) {
         const auto& kc = key_caches[i];
         const auto& vc = value_caches[i];
-        int32_t numel = static_cast<int32_t>(kc.size() / kc.shape(0));  // elements per block
+        int32_t numel = static_cast<int32_t>(kc.size() / kc.shape(0));
 
         std::string kname = "copy_blocks_" + dtypeStr(kc.dtype());
 
@@ -367,7 +331,6 @@ mx::array swap_blocks(
     const mx::array& block_mapping)
 {
     auto s = mx::default_stream(mx::Device::gpu);
-    // block_size_bytes = itemsize * product(shape[1:])
     int64_t block_numel = src.size() / src.shape(0);
     int64_t block_bytes = static_cast<int64_t>(block_numel * src.itemsize());
     int64_t num_pairs   = block_mapping.shape(0);

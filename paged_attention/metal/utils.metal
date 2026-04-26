@@ -4,6 +4,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
+#ifndef METAL_FUNC
+#define METAL_FUNC [[maybe_unused]] inline
+#endif
+
 #if defined(__HAVE_BFLOAT__)
 
 typedef bfloat bfloat16_t;

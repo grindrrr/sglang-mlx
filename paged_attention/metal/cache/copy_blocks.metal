@@ -10,7 +10,7 @@ template <typename T>
 [[kernel]] void copy_blocks(device T *key_cache [[buffer(0)]],
                             device T *value_cache [[buffer(1)]],
                             const device int64_t *block_mapping [[buffer(2)]],
-                            device const int &numel_per_block,
+                            constant int &numel_per_block [[buffer(3)]],
                             uint tgid [[threadgroup_position_in_grid]],
                             uint tid [[thread_position_in_threadgroup]],
                             uint threads_per_threadgroup
@@ -43,7 +43,7 @@ template <typename T>
   copy_blocks<type>(device type * key_cache [[buffer(0)]],                     \
                     device type * value_cache [[buffer(1)]],                   \
                     const device int64_t *block_mapping [[buffer(2)]],         \
-                    device const int &numel_per_block,                         \
+                    constant int &numel_per_block [[buffer(3)]],               \
                     uint tgid [[threadgroup_position_in_grid]],                \
                     uint tid [[thread_position_in_threadgroup]],               \
                     uint threads_per_threadgroup [[threads_per_threadgroup]]);

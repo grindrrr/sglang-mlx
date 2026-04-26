@@ -2,35 +2,14 @@
 // Modified for MLX integration
 
 #include "../utils.metal"
-#include "../float8.metal"
 #include <metal_stdlib>
 
 using namespace metal;
 
 template <typename KV_T, typename CACHE_T>
-inline CACHE_T to_cache(KV_T v) = delete;
-
-template <> inline uchar to_cache<float, uchar>(float v) {
-  return float_to_fp8_e4m3(v);
+inline CACHE_T to_cache(KV_T v) {
+    return static_cast<CACHE_T>(v);
 }
-
-template <> inline uchar to_cache<bfloat16_t, uchar>(bfloat16_t v) {
-  return float_to_fp8_e4m3((float)v);
-}
-
-template <> inline uchar to_cache<half, uchar>(half v) {
-  return float_to_fp8_e4m3((float)v);
-}
-
-template <> inline float to_cache<float, float>(float v) { return v; }
-
-template <> inline bfloat16_t to_cache<bfloat16_t, bfloat16_t>(bfloat16_t v) {
-  return v;
-}
-
-template <> inline half to_cache<half, half>(half v) { return v; }
-
-constant bool use_fp8_scales [[function_constant(10)]];
 
 template <typename KV_T, typename CACHE_T>
 [[kernel]] void reshape_and_cache(
@@ -42,12 +21,8 @@ template <typename KV_T, typename CACHE_T>
     [[buffer(2)]], // [num_blocks, num_heads, head_size/x, block_size, x]
     device CACHE_T *__restrict__ value_cache
     [[buffer(3)]], // [num_blocks, num_heads, head_size, block_size]
-    const device int64_t *__restrict__ slot_mapping
-    [[buffer(4)]], // [num_tokens]
-    const device float *__restrict__ k_scale
-    [[buffer(5)]], // [1] - only used when use_fp8_scales
-    const device float *__restrict__ v_scale
-    [[buffer(6)]], // [1] - only used when use_fp8_scales
+    const device int *__restrict__ slot_mapping
+    [[buffer(4)]], // [num_tokens] (Changed from int64 to int)
     device const int &key_stride [[buffer(7)]],
     device const int &value_stride [[buffer(8)]],
     device const int &num_heads [[buffer(9)]],
@@ -57,20 +32,19 @@ template <typename KV_T, typename CACHE_T>
     uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint threads_per_threadgroup [[threads_per_threadgroup]]) {
-  const int64_t token_idx = gid;
-  const int64_t slot_idx = slot_mapping[token_idx];
+  const int token_idx = gid;
+  const int slot_idx = slot_mapping[token_idx];
   if (slot_idx < 0) {
-    // Padding token that should be ignored.
     return;
   }
 
-  const int64_t block_idx = slot_idx / block_size;
-  const int64_t block_offset = slot_idx % block_size;
+  const int block_idx = slot_idx / block_size;
+  const int block_offset = slot_idx % block_size;
 
   const int n = num_heads * head_size;
   for (int i = tid; i < n; i += threads_per_threadgroup) {
-    const int64_t src_key_idx = token_idx * key_stride + i;
-    const int64_t src_value_idx = token_idx * value_stride + i;
+    const int src_key_idx = token_idx * key_stride + i;
+    const int src_value_idx = token_idx * value_stride + i;
 
     const int head_idx = i / head_size;
     const int head_offset = i % head_size;
@@ -78,23 +52,20 @@ template <typename KV_T, typename CACHE_T>
     const int x_offset = head_offset % x;
 
     const int64_t tgt_key_idx =
-        block_idx * num_heads * (head_size / x) * block_size * x +
-        head_idx * (head_size / x) * block_size * x + x_idx * block_size * x +
-        block_offset * x + x_offset;
-    const int64_t tgt_value_idx =
-        block_idx * num_heads * head_size * block_size +
-        head_idx * head_size * block_size + head_offset * block_size +
-        block_offset;
+        (int64_t)block_idx * (num_heads * (head_size / x) * block_size * x) +
+        (int64_t)head_idx  * ((head_size / x) * block_size * x) +
+        (int64_t)x_idx     * (block_size * x) +
+        (int64_t)block_offset * x +
+        (int64_t)x_offset;
 
-    if (use_fp8_scales) {
-      key_cache[tgt_key_idx] =
-          to_cache<KV_T, CACHE_T>(KV_T((float)key[src_key_idx] / *k_scale));
-      value_cache[tgt_value_idx] =
-          to_cache<KV_T, CACHE_T>(KV_T((float)value[src_value_idx] / *v_scale));
-    } else {
-      key_cache[tgt_key_idx] = to_cache<KV_T, CACHE_T>(key[src_key_idx]);
-      value_cache[tgt_value_idx] = to_cache<KV_T, CACHE_T>(value[src_value_idx]);
-    }
+    const int64_t tgt_value_idx =
+        (int64_t)block_idx * (num_heads * head_size * block_size) +
+        (int64_t)head_idx  * (head_size * block_size) +
+        (int64_t)head_offset * block_size +
+        (int64_t)block_offset;
+
+    key_cache[tgt_key_idx] = to_cache<KV_T, CACHE_T>(key[src_key_idx]);
+    value_cache[tgt_value_idx] = to_cache<KV_T, CACHE_T>(value[src_value_idx]);
   }
 }
 
@@ -106,9 +77,7 @@ template <typename KV_T, typename CACHE_T>
       const device kv_type *__restrict__ value [[buffer(1)]],                  \
       device cache_type *__restrict__ key_cache [[buffer(2)]],                 \
       device cache_type *__restrict__ value_cache [[buffer(3)]],               \
-      const device int64_t *__restrict__ slot_mapping [[buffer(4)]],           \
-      const device float *__restrict__ k_scale [[buffer(5)]],                  \
-      const device float *__restrict__ v_scale [[buffer(6)]],                  \
+      const device int *__restrict__ slot_mapping [[buffer(4)]],               \
       device const int &key_stride [[buffer(7)]],                              \
       device const int &value_stride [[buffer(8)]],                            \
       device const int &num_heads [[buffer(9)]],                               \
@@ -122,13 +91,10 @@ template <typename KV_T, typename CACHE_T>
 instantiate_reshape_and_cache(float, float);
 instantiate_reshape_and_cache(bfloat16_t, bfloat16_t);
 instantiate_reshape_and_cache(half, half);
+instantiate_reshape_and_cache(float, half);
+instantiate_reshape_and_cache(float, bfloat16_t);
 
-instantiate_reshape_and_cache(float, uchar);
-instantiate_reshape_and_cache(bfloat16_t, uchar);
-instantiate_reshape_and_cache(half, uchar);
-
-// Flash version with different cache layout: [num_blocks, block_size,
-// num_heads, head_size]
+// Flash version
 template <typename T>
 [[kernel]] void reshape_and_cache_flash(
     const device T *__restrict__ key
@@ -139,39 +105,32 @@ template <typename T>
     [[buffer(2)]], // [num_blocks, block_size, num_heads, head_size]
     device T *__restrict__ value_cache
     [[buffer(3)]], // [num_blocks, block_size, num_heads, head_size]
-    const device int64_t *__restrict__ slot_mapping
+    const device int *__restrict__ slot_mapping
     [[buffer(4)]], // [num_tokens]
     device const int &key_stride, device const int &value_stride,
     device const int &num_heads, device const int &head_size,
     device const int &block_size, uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint threads_per_threadgroup [[threads_per_threadgroup]]) {
-  const int64_t token_idx = gid;
-  const int64_t slot_idx = slot_mapping[token_idx];
+  const int token_idx = gid;
+  const int slot_idx = slot_mapping[token_idx];
   if (slot_idx < 0) {
-    // Padding token that should be ignored.
     return;
   }
 
-  const int64_t block_idx = slot_idx / block_size;
-  const int64_t block_offset = slot_idx % block_size;
+  const int block_idx = slot_idx / block_size;
+  const int block_offset = slot_idx % block_size;
 
   const int n = num_heads * head_size;
   for (int i = tid; i < n; i += threads_per_threadgroup) {
-    const int64_t src_key_idx = token_idx * key_stride + i;
-    const int64_t src_value_idx = token_idx * value_stride + i;
+    const int64_t src_key_idx = (int64_t)token_idx * key_stride + i;
+    const int64_t src_value_idx = (int64_t)token_idx * value_stride + i;
 
-    const int head_idx = i / head_size;
-    const int head_offset = i % head_size;
-
-    // Flash cache layout: [num_blocks, block_size, num_heads, head_size]
-    const int64_t tgt_key_idx = block_idx * block_size * num_heads * head_size +
-                                block_offset * num_heads * head_size +
-                                head_idx * head_size + head_offset;
-    const int64_t tgt_value_idx =
-        block_idx * block_size * num_heads * head_size +
-        block_offset * num_heads * head_size + head_idx * head_size +
-        head_offset;
+    const int64_t tgt_key_idx = (int64_t)block_idx * block_size * num_heads * head_size +
+                                (int64_t)block_offset * num_heads * head_size + i;
+    const int64_t tgt_value_idx = (int64_t)block_idx * block_size * num_heads * head_size +
+                                  (int64_t)block_offset * num_heads * head_size + i;
+    
     key_cache[tgt_key_idx] = key[src_key_idx];
     value_cache[tgt_value_idx] = value[src_value_idx];
   }
@@ -184,7 +143,7 @@ template <typename T>
       const device type *__restrict__ value [[buffer(1)]],                     \
       device type *__restrict__ key_cache [[buffer(2)]],                       \
       device type *__restrict__ value_cache [[buffer(3)]],                     \
-      const device int64_t *__restrict__ slot_mapping [[buffer(4)]],           \
+      const device int *__restrict__ slot_mapping [[buffer(4)]],               \
       device const int &key_stride, device const int &value_stride,            \
       device const int &num_heads, device const int &head_size,                \
       device const int &block_size, uint gid [[threadgroup_position_in_grid]], \

@@ -1,7 +1,7 @@
 """Tests for Metal paged attention kernels.
 
-Validates reshape_and_cache (scatter-write) and paged_attention_v1
-(attention computation) against a numpy naive reference.
+Validates reshape_and_cache (scatter-write), paged_attention_v1
+(attention computation), and cache block-copy operations.
 
 All tests require the compiled Metal extension (_ext) and are skipped
 when it is not available.
@@ -328,6 +328,114 @@ class TestPagedAttentionKernels:
             num_kv_heads,
         )
         np.testing.assert_allclose(np.array(out), ref, atol=5e-3)
+
+    def test_empty_context_returns_zero(self):
+        head_dim = 32
+        block_size = 16
+        q = mx.random.normal((1, 2, head_dim))
+        k_cache = mx.zeros((1, 1, head_dim // 8, block_size, 8), dtype=mx.float16)
+        v_cache = mx.zeros((1, 1, head_dim, block_size), dtype=mx.float16)
+        block_tables = mx.array([[0]], dtype=mx.int32)
+        context_lens = mx.array([0], dtype=mx.int32)
+
+        out = _ext.paged_attention_v1(
+            q,
+            k_cache,
+            v_cache,
+            block_tables,
+            context_lens,
+            1,
+            1.0 / math.sqrt(head_dim),
+            block_size,
+            block_size,
+        )
+        mx.eval(out)
+
+        np.testing.assert_array_equal(np.array(out), np.zeros(out.shape))
+
+    def test_context_over_max_seq_len_returns_zero(self):
+        head_dim = 32
+        block_size = 16
+        q = mx.random.normal((1, 2, head_dim))
+        k_cache = mx.zeros((1, 1, head_dim // 8, block_size, 8), dtype=mx.float16)
+        v_cache = mx.zeros((1, 1, head_dim, block_size), dtype=mx.float16)
+        block_tables = mx.array([[0]], dtype=mx.int32)
+        context_lens = mx.array([block_size], dtype=mx.int32)
+
+        out = _ext.paged_attention_v1(
+            q,
+            k_cache,
+            v_cache,
+            block_tables,
+            context_lens,
+            1,
+            1.0 / math.sqrt(head_dim),
+            block_size,
+            block_size // 2,
+        )
+        mx.eval(out)
+
+        np.testing.assert_array_equal(np.array(out), np.zeros(out.shape))
+
+    def test_rejects_max_seq_len_beyond_block_table_capacity(self):
+        head_dim = 32
+        block_size = 16
+        q = mx.zeros((1, 2, head_dim))
+        k_cache = mx.zeros((2, 1, head_dim // 8, block_size, 8), dtype=mx.float16)
+        v_cache = mx.zeros((2, 1, head_dim, block_size), dtype=mx.float16)
+
+        with pytest.raises(ValueError, match="block table capacity"):
+            _ext.paged_attention_v1(
+                q,
+                k_cache,
+                v_cache,
+                mx.array([[0]], dtype=mx.int32),
+                mx.array([1], dtype=mx.int32),
+                1,
+                1.0,
+                block_size,
+                block_size + 1,
+            )
+
+    def test_copy_blocks_multiple_layers(self):
+        key_caches = []
+        value_caches = []
+        key_before = []
+        value_before = []
+        for layer in range(2):
+            key_np = np.arange(24, dtype=np.float32).reshape(4, 2, 3) + layer * 100
+            value_np = key_np + 1000
+            key_before.append(key_np.copy())
+            value_before.append(value_np.copy())
+            key_caches.append(mx.array(key_np))
+            value_caches.append(mx.array(value_np))
+
+        mapping = mx.array([[0, 2], [1, 3]], dtype=mx.int32)
+        new_keys, new_values = _ext.copy_blocks(key_caches, value_caches, mapping)
+        mx.eval(*new_keys, *new_values)
+
+        for layer in range(2):
+            expected_key = key_before[layer].copy()
+            expected_value = value_before[layer].copy()
+            expected_key[2] = key_before[layer][0]
+            expected_key[3] = key_before[layer][1]
+            expected_value[2] = value_before[layer][0]
+            expected_value[3] = value_before[layer][1]
+            np.testing.assert_array_equal(np.array(new_keys[layer]), expected_key)
+            np.testing.assert_array_equal(np.array(new_values[layer]), expected_value)
+
+    def test_swap_blocks_noncontiguous_mapping(self):
+        src_np = np.arange(24, dtype=np.float32).reshape(4, 2, 3)
+        dst_np = np.full((4, 2, 3), -1, dtype=np.float32)
+        mapping = mx.array([[0, 2], [3, 1]], dtype=mx.int32)
+
+        out = _ext.swap_blocks(mx.array(src_np), mx.array(dst_np), mapping)
+        mx.eval(out)
+
+        expected = dst_np.copy()
+        expected[2] = src_np[0]
+        expected[1] = src_np[3]
+        np.testing.assert_array_equal(np.array(out), expected)
 
 
 if __name__ == "__main__":

@@ -10,8 +10,6 @@ using namespace metal;
                        "_nsl" #num_simd_lanes)]] [[kernel]] void               \
   paged_attention<type, cache_type, head_size, block_size, num_threads,        \
                   num_simd_lanes>(                                             \
-      device float *exp_sums [[buffer(0)]],                                    \
-      device float *max_logits [[buffer(1)]],                                  \
       device type *out [[buffer(2)]], device const type *q [[buffer(3)]],      \
       device const cache_type *k_cache [[buffer(4)]],                          \
       device const cache_type *v_cache [[buffer(5)]],                          \

@@ -108,9 +108,7 @@ struct PagedAttentionV1 : mx::Primitive {
         std::string lib_path = getModuleDirectory() + "/" METALLIB_PATH;
         auto* lib = d.get_library("paged_attention_mlx", lib_path);
 
-        bool use_partitioning = false;
         mx::metal::MTLFCList fc = {
-            {&use_partitioning, MTL::DataTypeBool, NS::UInteger(10)},
             {&use_alibi_,       MTL::DataTypeBool, NS::UInteger(20)},
         };
         auto* kernel = d.get_kernel(kernel_name_, lib, kernel_name_, fc);
@@ -118,15 +116,6 @@ struct PagedAttentionV1 : mx::Primitive {
         auto& enc = d.get_command_encoder(s.index);
         enc.set_compute_pipeline_state(kernel);
 
-        // Dummy buffers for V1 compatibility with kernel signature if needed,
-        // but our simplified kernel doesn't use buffers 0 and 1 for V1.
-        mx::array exp_sums_dummy({1}, mx::float32);
-        mx::array max_logits_dummy({1}, mx::float32);
-        exp_sums_dummy.set_data(mx::allocator::malloc(exp_sums_dummy.nbytes()));
-        max_logits_dummy.set_data(mx::allocator::malloc(max_logits_dummy.nbytes()));
-
-        enc.set_output_array(exp_sums_dummy, 0);
-        enc.set_output_array(max_logits_dummy, 1);
         enc.set_output_array(outputs[0], 2);
         enc.set_input_array(inputs[0],  3);
         enc.set_input_array(inputs[1],  4);
@@ -164,6 +153,36 @@ mx::array paged_attention_v1(
     int num_kv_heads, float scale, int block_size, int max_seq_len,
     const std::optional<mx::array>& alibi_slopes)
 {
+    if (query.ndim() != 3)
+        throw std::invalid_argument("query must have shape [num_seqs, num_heads, head_size]");
+    if (key_cache.ndim() != 5 || value_cache.ndim() != 4)
+        throw std::invalid_argument("key_cache/value_cache must use paged attention layouts");
+    if (block_tables.ndim() != 2 || context_lens.ndim() != 1)
+        throw std::invalid_argument("block_tables must be 2D and context_lens must be 1D");
+    if (query.shape(0) != block_tables.shape(0) ||
+        query.shape(0) != context_lens.shape(0))
+        throw std::invalid_argument("query, block_tables, and context_lens sequence counts differ");
+    if (num_kv_heads <= 0 || query.shape(1) % num_kv_heads != 0)
+        throw std::invalid_argument("num_heads must be divisible by num_kv_heads");
+    if (key_cache.shape(1) != num_kv_heads ||
+        value_cache.shape(1) != num_kv_heads)
+        throw std::invalid_argument("cache KV-head count does not match num_kv_heads");
+    if (key_cache.shape(2) * key_cache.shape(4) != query.shape(2) ||
+        value_cache.shape(2) != query.shape(2))
+        throw std::invalid_argument("cache head size does not match query head size");
+    if (key_cache.shape(0) != value_cache.shape(0) ||
+        key_cache.shape(3) != block_size ||
+        value_cache.shape(3) != block_size)
+        throw std::invalid_argument("cache block dimensions do not match block_size");
+    if (alibi_slopes.has_value() &&
+        (alibi_slopes->ndim() != 1 ||
+         alibi_slopes->shape(0) != query.shape(1)))
+        throw std::invalid_argument("alibi_slopes must have shape [num_heads]");
+    if (max_seq_len <= 0)
+        throw std::invalid_argument("max_seq_len must be positive");
+    if (max_seq_len > block_tables.shape(1) * block_size)
+        throw std::invalid_argument("max_seq_len exceeds block table capacity");
+
     int head_size = query.shape(2);
     if (!isValidConfig(head_size, block_size))
         throw std::invalid_argument("Unsupported head_size/block_size for paged_attention");
@@ -173,6 +192,11 @@ mx::array paged_attention_v1(
     const size_t smem =
         static_cast<size_t>(max_seq_len + 128 + (nt / nsl) * head_size)
         * sizeof(float);
+    const size_t max_smem = static_cast<size_t>(
+        get_max_shared_memory_per_block_device_attribute(0));
+    if (smem > max_smem)
+        throw std::invalid_argument(
+            "max_seq_len requires more threadgroup memory than this Metal device supports");
 
     std::string kname = attnKernelName(query.dtype(), key_cache.dtype(),
                                        head_size, block_size, nt, nsl);

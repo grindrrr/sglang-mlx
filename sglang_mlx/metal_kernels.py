@@ -6,7 +6,7 @@ API. All operations delegate directly to the C++/Metal kernels built in
 paged_attention/ and compiled into sglang_mlx/_ext.
 
 Available operations:
-    paged_attention_v1   — single-pass paged attention (decode)
+    paged_attention_v1   — single-pass, non-partitioned paged attention (decode)
     reshape_and_cache    — scatter KV tokens into paged blocks
     copy_blocks          — intra-cache block copying
     swap_blocks          — inter-cache block copying (e.g. host <-> device)

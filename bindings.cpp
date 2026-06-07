@@ -60,7 +60,8 @@ NB_MODULE(_ext, m) {
         nb::arg("num_kv_heads"), nb::arg("scale"),
         nb::arg("block_size"), nb::arg("max_seq_len"),
         nb::arg("alibi_slopes")   = nb::none(),
-        "Single-pass paged attention. Returns out [num_seqs, num_heads, head_size]."
+        "Single-pass, non-partitioned paged attention. "
+        "Returns out [num_seqs, num_heads, head_size]."
     );
 
     m.def("reshape_and_cache",

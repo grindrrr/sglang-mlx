@@ -12,8 +12,6 @@ constant bool use_alibi [[function_constant(20)]];
 template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS,
           int NUM_SIMD_LANES>
 [[kernel]] void paged_attention(
-    device float *exp_sums [[buffer(0)]],
-    device float *max_logits [[buffer(1)]],
     device T *out [[buffer(2)]],
     device const T *q [[buffer(3)]],
     device const CACHE_T *k_cache [[buffer(4)]],
@@ -36,17 +34,20 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     uint simd_tid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   
-  (void)exp_sums;
-  (void)max_logits;
-
   const int seq_idx = (int)threadgroup_position_in_grid.y;
   const int head_idx = (int)threadgroup_position_in_grid.x;
   const int num_heads = (int)threadgroups_per_grid.x;
   const int thread_idx = (int)thread_position_in_threadgroup.x;
-  
+
+  device T *out_ptr = out + (int64_t)seq_idx * num_heads * HEAD_SIZE +
+                      (int64_t)head_idx * HEAD_SIZE;
   const uint32_t context_len = context_lens[seq_idx];
-  if (context_len == 0) return;
-  if (context_len > (uint32_t)max_seq_len) return;
+  if (context_len == 0 || context_len > (uint32_t)max_seq_len) {
+    for (int i = thread_idx; i < HEAD_SIZE; i += NUM_THREADS) {
+      out_ptr[i] = (T)0;
+    }
+    return;
+  }
   
   const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
   constexpr int NUM_WARPS = NUM_THREADS / NUM_SIMD_LANES;
@@ -160,7 +161,6 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Step 3: Write Output
-  device T *out_ptr = out + (int64_t)seq_idx * num_heads * HEAD_SIZE + (int64_t)head_idx * HEAD_SIZE;
   for (int i = thread_idx; i < HEAD_SIZE; i += NUM_THREADS) {
     float final_acc = 0.f;
     for (int w = 0; w < NUM_WARPS; w++) final_acc += out_smem[w * HEAD_SIZE + i];

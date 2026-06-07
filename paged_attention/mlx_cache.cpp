@@ -30,6 +30,7 @@ static std::string dtypeStr(mx::Dtype d) {
         case mx::float32:  return "float";
         case mx::float16:  return "half";
         case mx::bfloat16: return "bfloat16_t";
+        case mx::uint8:    return "uchar";
         default: throw std::invalid_argument("Unsupported cache dtype");
     }
 }
@@ -166,7 +167,9 @@ struct CopyBlocksLayer : mx::Primitive {
     const char* name() const override { return "CopyBlocksLayer"; }
     bool is_equivalent(const mx::Primitive& o) const override {
         const auto& p = static_cast<const CopyBlocksLayer&>(o);
-        return kernel_name_ == p.kernel_name_ && numel_per_block_ == p.numel_per_block_;
+        return kernel_name_ == p.kernel_name_ &&
+            numel_per_block_ == p.numel_per_block_ &&
+            num_pairs_ == p.num_pairs_;
     }
     void eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) override {
         throw std::runtime_error("CopyBlocksLayer is GPU-only");
@@ -202,17 +205,22 @@ struct CopyBlocksLayer : mx::Primitive {
 // ── SwapBlocks ────────────────────────────────────────────────────────────────
 
 struct SwapBlocks : mx::Primitive {
-    int64_t block_size_bytes_;
+    std::string kernel_name_;
+    int32_t numel_per_block_;
     int64_t num_pairs_;
 
-    SwapBlocks(mx::Stream s, int64_t block_size_bytes, int64_t num_pairs)
+    SwapBlocks(mx::Stream s, std::string kname,
+               int32_t numel_per_block, int64_t num_pairs)
         : mx::Primitive(s),
-          block_size_bytes_(block_size_bytes), num_pairs_(num_pairs) {}
+          kernel_name_(std::move(kname)),
+          numel_per_block_(numel_per_block), num_pairs_(num_pairs) {}
 
     const char* name() const override { return "SwapBlocks"; }
     bool is_equivalent(const mx::Primitive& o) const override {
         const auto& p = static_cast<const SwapBlocks&>(o);
-        return block_size_bytes_ == p.block_size_bytes_;
+        return kernel_name_ == p.kernel_name_ &&
+            numel_per_block_ == p.numel_per_block_ &&
+            num_pairs_ == p.num_pairs_;
     }
     void eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) override {
         throw std::runtime_error("SwapBlocks is GPU-only");
@@ -225,20 +233,21 @@ struct SwapBlocks : mx::Primitive {
 
         outputs[0].copy_shared_buffer(inputs[1]);
 
-        auto* cmd_buf = d.get_command_buffer(s.index);
-        auto* blit    = cmd_buf->blitCommandEncoder();
+        std::string lib_path = getModuleDirectory() + "/" METALLIB_PATH;
+        auto* lib = d.get_library("paged_attention_mlx", lib_path);
+        auto* kernel = d.get_kernel(kernel_name_, lib);
 
-        auto* src_buf = static_cast<MTL::Buffer*>(const_cast<void*>(inputs[0].buffer().ptr()));
-        auto* dst_buf = static_cast<MTL::Buffer*>(const_cast<void*>(outputs[0].buffer().ptr()));
+        auto& enc = d.get_command_encoder(s.index);
+        enc.set_compute_pipeline_state(kernel);
+        enc.set_input_array(inputs[0], 0);
+        enc.set_output_array(outputs[0], 1);
+        enc.set_input_array(inputs[2], 2);
+        enc.set_bytes(numel_per_block_, 3);
 
-        const int64_t* bm = inputs[2].data<int64_t>();
-        for (int64_t i = 0; i < num_pairs_; ++i) {
-            NS::UInteger src_off = static_cast<NS::UInteger>(bm[i * 2    ] * block_size_bytes_);
-            NS::UInteger dst_off = static_cast<NS::UInteger>(bm[i * 2 + 1] * block_size_bytes_);
-            blit->copyFromBuffer(src_buf, src_off, dst_buf, dst_off,
-                                 static_cast<NS::UInteger>(block_size_bytes_));
-        }
-        blit->endEncoding();
+        uint32_t tg_size = std::min<uint32_t>(256, numel_per_block_);
+        enc.dispatch_threadgroups(
+            MTL::Size::Make(num_pairs_, 1, 1),
+            MTL::Size::Make(tg_size, 1, 1));
     }
 };
 
@@ -298,9 +307,12 @@ std::pair<std::vector<mx::array>, std::vector<mx::array>> copy_blocks(
     auto s = mx::default_stream(mx::Device::gpu);
     if (key_caches.size() != value_caches.size())
         throw std::invalid_argument("key_caches and value_caches size mismatch");
+    if (block_mapping.ndim() != 2 || block_mapping.shape(1) != 2)
+        throw std::invalid_argument("block_mapping must have shape [num_pairs, 2]");
 
     int64_t num_pairs     = block_mapping.shape(0);
     int64_t num_layers    = static_cast<int64_t>(key_caches.size());
+    auto mapping_i64 = mx::astype(block_mapping, mx::int64);
 
     std::vector<mx::array> new_keys, new_vals;
     new_keys.reserve(num_layers);
@@ -309,6 +321,13 @@ std::pair<std::vector<mx::array>, std::vector<mx::array>> copy_blocks(
     for (int64_t i = 0; i < num_layers; ++i) {
         const auto& kc = key_caches[i];
         const auto& vc = value_caches[i];
+        if (kc.ndim() == 0 || vc.ndim() == 0 ||
+            kc.shape(0) == 0 || vc.shape(0) == 0 ||
+            kc.shape(0) != vc.shape(0))
+            throw std::invalid_argument("key/value caches must have matching block counts");
+        if (kc.dtype() != vc.dtype() ||
+            kc.size() / kc.shape(0) != vc.size() / vc.shape(0))
+            throw std::invalid_argument("key/value cache block layouts must match");
         int32_t numel = static_cast<int32_t>(kc.size() / kc.shape(0));
 
         std::string kname = "copy_blocks_" + dtypeStr(kc.dtype());
@@ -318,7 +337,7 @@ std::pair<std::vector<mx::array>, std::vector<mx::array>> copy_blocks(
             {kc.shape(), vc.shape()},
             {kc.dtype(), vc.dtype()},
             prim,
-            {kc, vc, block_mapping});
+            {kc, vc, mapping_i64});
 
         new_keys.push_back(outs[0]);
         new_vals.push_back(outs[1]);
@@ -331,11 +350,21 @@ mx::array swap_blocks(
     const mx::array& block_mapping)
 {
     auto s = mx::default_stream(mx::Device::gpu);
-    int64_t block_numel = src.size() / src.shape(0);
-    int64_t block_bytes = static_cast<int64_t>(block_numel * src.itemsize());
+    if (src.ndim() == 0 || dst.ndim() == 0 ||
+        src.shape(0) == 0 || dst.shape(0) == 0)
+        throw std::invalid_argument("src and dst must have a leading block dimension");
+    if (src.dtype() != dst.dtype() ||
+        src.size() / src.shape(0) != dst.size() / dst.shape(0))
+        throw std::invalid_argument("src and dst block layouts must match");
+    if (block_mapping.ndim() != 2 || block_mapping.shape(1) != 2)
+        throw std::invalid_argument("block_mapping must have shape [num_pairs, 2]");
+    int32_t block_numel = static_cast<int32_t>(src.size() / src.shape(0));
     int64_t num_pairs   = block_mapping.shape(0);
+    auto mapping_i64 = mx::astype(block_mapping, mx::int64);
 
-    auto prim   = std::make_shared<SwapBlocks>(s, block_bytes, num_pairs);
+    std::string kname = "swap_blocks_" + dtypeStr(src.dtype());
+    auto prim = std::make_shared<SwapBlocks>(
+        s, kname, block_numel, num_pairs);
 
-    return mx::array(dst.shape(), dst.dtype(), prim, {src, dst, block_mapping});
+    return mx::array(dst.shape(), dst.dtype(), prim, {src, dst, mapping_i64});
 }

@@ -4,7 +4,20 @@ SGLang-style LLM serving for Apple Silicon, built on **pure MLX — no PyTorch**
 
 ## Why
 
-Bring SGLang's high-throughput serving to Apple Silicon. The key insight: Apple's unified memory eliminates the need for paged attention, but prefix sharing via the radix tree still delivers massive wins.
+Bring SGLang's high-throughput serving to Apple Silicon. Unified memory changes
+the paging tradeoffs, while block-addressable KV caches and radix-tree prefix
+sharing still provide important serving wins.
+
+## Paged Attention Kernel Scope
+
+The Metal extension currently provides a single-pass, non-partitioned decode
+kernel exposed as `paged_attention_v1`. Each sequence/head pair is handled by
+one threadgroup. This is intended for initial correctness and batched decode
+validation; it is not a direct port of vLLM's CUDA-specific V2 path.
+
+Long-context, batch-1 behavior should be benchmarked before introducing a
+Metal-native partitioned implementation. The current path validates device
+threadgroup-memory requirements before dispatch.
 
 ## Architecture
 

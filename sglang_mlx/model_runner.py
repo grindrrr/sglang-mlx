@@ -6,7 +6,7 @@ token at a time).
 
 Components:
 - ModelConfig: extracted model dimensions
-- RequestState: mutable per-request state (slots, tokens, caches)
+- RequestState: mutable per-request state (blocks, tokens, caches)
 - ForwardResult: logits from a single forward pass
 - ModelRunner: orchestrates loading, cache management, and forward passes
 """
@@ -22,10 +22,12 @@ from typing import Any
 import mlx.core as mx
 
 from sglang_mlx.srt.mem_cache.base_prefix_cache import InsertParams
-from sglang_mlx.srt.mem_cache.memory_pool import (
-    MHATokenPool,
-    PooledKVCache,
-    TokenPoolAllocator,
+from sglang_mlx.srt.mem_cache.paged_pool import (
+    BlockAllocator,
+    PagedKVCache,
+    PagedMHAPool,
+    block_table_from_token_blocks,
+    expand_blocks_to_tokens,
 )
 from sglang_mlx.srt.mem_cache.radix_cache import RadixCache
 
@@ -57,10 +59,11 @@ class RequestState:
     request_id: str
     prompt_tokens: list[int]
     output_tokens: list[int]
-    all_slot_indices: list[int]  # prefix + generated pool slots
+    all_block_indices: list[int]  # token-granular physical block IDs
     radix_node: Any  # for lock/unlock
     prefix_len: int  # tokens reused from radix cache
-    kv_caches: list[PooledKVCache]
+    kv_caches: list[PagedKVCache]
+    committed_len: int = 0
 
     @property
     def seq_len(self) -> int:
@@ -69,8 +72,8 @@ class RequestState:
 
     @property
     def total_cached_len(self) -> int:
-        """Number of KV slots currently allocated."""
-        return len(self.all_slot_indices)
+        """Number of token positions currently backed by KV blocks."""
+        return len(self.all_block_indices)
 
 
 @dataclasses.dataclass
@@ -130,7 +133,7 @@ def _extract_model_config(model: Any, config_dict: dict | None = None) -> ModelC
 class ModelRunner:
     """Orchestrates model loading, KV cache management, and forward passes.
 
-    Owns the KV pool, slot allocator, and radix cache.  Provides methods for
+    Owns the KV pool, block allocator, and radix cache.  Provides methods for
     prefill (prompt processing with prefix reuse), decode (one token at a
     time), and a convenience ``generate`` loop.
     """
@@ -141,20 +144,23 @@ class ModelRunner:
         tokenizer: Any,
         config: ModelConfig,
         pool_size: int = 4096,
+        block_size: int = 16,
         dtype: mx.Dtype = mx.float16,
     ):
         self._model = model
         self._tokenizer = tokenizer
         self._config = config
         self._pool_size = pool_size
+        self._block_size = block_size
         self._dtype = dtype
 
-        self._allocator = TokenPoolAllocator(pool_size)
-        self._pool = MHATokenPool(
-            pool_size=pool_size,
+        self._allocator = BlockAllocator(pool_size, block_size)
+        self._pool = PagedMHAPool(
+            num_blocks=pool_size,
             num_layers=config.num_layers,
             n_kv_heads=config.n_kv_heads,
             head_dim=config.head_dim,
+            block_size=block_size,
             dtype=dtype,
         )
         self._radix_cache = RadixCache()
@@ -166,6 +172,7 @@ class ModelRunner:
         cls,
         model_path: str,
         pool_size: int = 4096,
+        block_size: int = 16,
         dtype: mx.Dtype = mx.float16,
     ) -> ModelRunner:
         """Load a model from a local path or HuggingFace Hub ID.
@@ -173,7 +180,7 @@ class ModelRunner:
         Args:
             model_path: Local directory or HF model ID
                 (e.g. ``mlx-community/...``).
-            pool_size: Number of token slots in the KV pool.
+            pool_size: Number of physical blocks in the KV pool.
             dtype: Data type for KV cache buffers.
 
         Returns:
@@ -183,7 +190,7 @@ class ModelRunner:
 
         model, tokenizer = mlx_load(model_path)
         config = _extract_model_config(model)
-        return cls(model, tokenizer, config, pool_size, dtype)
+        return cls(model, tokenizer, config, pool_size, block_size, dtype)
 
     # ---- Core forward methods ----
 
@@ -203,25 +210,27 @@ class ModelRunner:
         """
         # 1. Match prefix in radix cache
         match = self._radix_cache.match_prefix(prompt_tokens)
-        prefix_indices = list(match.device_indices)
-        prefix_len = len(prefix_indices)
+        matched_token_blocks = list(match.device_indices)
+        prefix_len = self._usable_prefix_len(len(matched_token_blocks))
 
-        # 2. Handle full cache hit: reprocess last token for logits
-        if prefix_len >= len(prompt_tokens) and prefix_len > 0:
-            prefix_len -= 1
-            reused_slot = [prefix_indices[prefix_len]]
-            prefix_indices = prefix_indices[:prefix_len]
-            new_tokens = prompt_tokens[prefix_len:]
-            new_slot_indices = reused_slot
-        else:
-            new_tokens = prompt_tokens[prefix_len:]
-            new_slot_indices = self._allocator.alloc(len(new_tokens))
+        # Full block-aligned cache hits still need logits. Recompute the final
+        # block and keep that transient block out of the radix cache.
+        recompute_full_hit = prefix_len >= len(prompt_tokens) and prefix_len > 0
+        if recompute_full_hit:
+            prefix_len = max(0, prefix_len - self._block_size)
 
-        # 3. Create per-layer PooledKVCache
-        kv_caches: list[PooledKVCache] = []
+        prefix_token_blocks = matched_token_blocks[:prefix_len]
+        prefix_blocks = block_table_from_token_blocks(
+            prefix_token_blocks, self._block_size
+        )
+        new_tokens = prompt_tokens[prefix_len:]
+        new_blocks = self._allocator.alloc_for_tokens(len(new_tokens))
+
+        # 3. Create per-layer PagedKVCache
+        kv_caches: list[PagedKVCache] = []
         for i in range(self._config.num_layers):
-            cache = PooledKVCache(self._pool, layer_idx=i)
-            cache.set_indices(prefix_indices, new_slot_indices)
+            cache = PagedKVCache(self._pool, layer_idx=i)
+            cache.set_blocks(prefix_blocks, new_blocks, prefix_len)
             kv_caches.append(cache)
 
         # 4. Run model forward — single mx.eval sync point
@@ -230,25 +239,30 @@ class ModelRunner:
         mx.eval(logits)
 
         # 5. Insert into radix cache
-        all_slot_indices = prefix_indices + list(new_slot_indices)
-        self._radix_cache.insert(
-            InsertParams(key=list(prompt_tokens), value=list(all_slot_indices))
+        all_block_indices = prefix_token_blocks + expand_blocks_to_tokens(
+            new_blocks, len(new_tokens), self._block_size
         )
+        if recompute_full_hit:
+            committed_len = prefix_len
+        else:
+            committed_len = self._commit_full_blocks(prompt_tokens, all_block_indices)
 
         # 6. Lock the node to prevent eviction during decoding
-        match_after = self._radix_cache.match_prefix(prompt_tokens)
+        match_after = self._radix_cache.match_prefix(prompt_tokens[:committed_len])
         radix_node = match_after.last_node
-        self._radix_cache.inc_lock_ref(radix_node)
+        if committed_len > 0:
+            self._radix_cache.inc_lock_ref(radix_node)
 
         # 7. Build state
         state = RequestState(
             request_id=request_id,
             prompt_tokens=list(prompt_tokens),
             output_tokens=[],
-            all_slot_indices=list(all_slot_indices),
+            all_block_indices=list(all_block_indices),
             radix_node=radix_node,
             prefix_len=prefix_len,
             kv_caches=kv_caches,
+            committed_len=committed_len,
         )
         self._active_requests[request_id] = state
 
@@ -267,12 +281,16 @@ class ModelRunner:
         Returns:
             ForwardResult with logits for sampling the next token.
         """
-        # 1. Allocate 1 new slot
-        new_slot = self._allocator.alloc(1)
+        # 1. Allocate a new block only when the next token starts a new page.
+        old_len = state.seq_len
+        new_blocks = self._allocator.alloc(1) if old_len % self._block_size == 0 else []
+        prefix_blocks = block_table_from_token_blocks(
+            state.all_block_indices, self._block_size
+        )
 
-        # 2. Update per-layer caches: all existing slots become prefix
+        # 2. Update per-layer caches: all existing tokens become prefix
         for cache in state.kv_caches:
-            cache.set_indices(state.all_slot_indices, new_slot)
+            cache.set_blocks(prefix_blocks, new_blocks, old_len)
 
         # 3. Run model forward — single mx.eval sync point
         input_ids = mx.array([[token_id]])  # (1, 1)
@@ -281,13 +299,23 @@ class ModelRunner:
 
         # 4. Update state
         state.output_tokens.append(token_id)
-        state.all_slot_indices.extend(new_slot)
+        all_blocks = prefix_blocks + new_blocks
+        state.all_block_indices.append(all_blocks[old_len // self._block_size])
 
-        # 5. Insert into radix cache (extends tree by 1 token)
+        # 5. Commit newly completed full blocks to the radix cache.
         all_tokens = state.prompt_tokens + state.output_tokens
-        self._radix_cache.insert(
-            InsertParams(key=all_tokens, value=list(state.all_slot_indices))
+        old_committed_len = state.committed_len
+        state.committed_len = self._commit_full_blocks(
+            all_tokens, state.all_block_indices
         )
+        if state.committed_len > old_committed_len:
+            if old_committed_len > 0:
+                self._radix_cache.dec_lock_ref(state.radix_node)
+            match_after = self._radix_cache.match_prefix(
+                all_tokens[: state.committed_len]
+            )
+            state.radix_node = match_after.last_node
+            self._radix_cache.inc_lock_ref(state.radix_node)
 
         last_logits = logits[0, -1, :]  # (V,)
         return ForwardResult(logits=last_logits, forward_mode=ForwardMode.DECODE)
@@ -298,7 +326,11 @@ class ModelRunner:
         Args:
             state: The completed request's state.
         """
-        self._radix_cache.dec_lock_ref(state.radix_node)
+        if state.committed_len > 0:
+            self._radix_cache.dec_lock_ref(state.radix_node)
+        tail_blocks = state.all_block_indices[state.committed_len :]
+        if tail_blocks:
+            self._allocator.free(tail_blocks)
         self._active_requests.pop(state.request_id, None)
 
     def generate(
@@ -339,6 +371,27 @@ class ModelRunner:
 
         self.finish_request(state)
         return generated
+
+    def _usable_prefix_len(self, matched_len: int) -> int:
+        """Only full blocks are shareable through the radix cache."""
+        return (matched_len // self._block_size) * self._block_size
+
+    def _commit_full_blocks(
+        self,
+        tokens: list[int],
+        token_blocks: list[int],
+    ) -> int:
+        """Insert the full-block prefix into radix and return committed length."""
+        committed_len = self._usable_prefix_len(len(token_blocks))
+        if committed_len == 0:
+            return 0
+        self._radix_cache.insert(
+            InsertParams(
+                key=list(tokens[:committed_len]),
+                value=list(token_blocks[:committed_len]),
+            )
+        )
+        return committed_len
 
 
 def _argmax_sampler(logits: mx.array) -> int:

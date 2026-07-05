@@ -22,6 +22,7 @@ VOCAB_SIZE = 32
 HIDDEN_SIZE = 32
 NUM_ATTENTION_HEADS = 4
 POOL_SIZE = 64
+BLOCK_SIZE = 8
 
 
 # ---- Mock model ----
@@ -30,10 +31,8 @@ POOL_SIZE = 64
 class MockModel:
     """Minimal model that simulates mlx-lm cache interaction.
 
-    On each ``__call__``, iterates over the cache list and calls
-    ``update_and_fetch`` with zero-valued KV tensors, just like a real
-    model's attention layers would.  Returns zero logits so that argmax
-    always selects token 0.
+    Returns zero logits so that argmax always selects token 0. Kernel-backed
+    cache writes are covered by the paged attention tests.
     """
 
     def __init__(
@@ -65,9 +64,7 @@ class MockModel:
 
         if cache is not None:
             for c in cache:
-                keys = mx.zeros((B, self._n_kv_heads, S, self._head_dim))
-                values = mx.zeros((B, self._n_kv_heads, S, self._head_dim))
-                c.update_and_fetch(keys, values)
+                assert c.offset >= 0
 
         return mx.zeros((B, S, self._vocab_size))
 
@@ -87,6 +84,7 @@ def _make_runner(
     vocab_size: int = VOCAB_SIZE,
     hidden_size: int = HIDDEN_SIZE,
     num_attention_heads: int = NUM_ATTENTION_HEADS,
+    block_size: int = BLOCK_SIZE,
 ) -> tuple[ModelRunner, MockModel]:
     """Build a ModelRunner wired to a MockModel."""
     model = MockModel(
@@ -106,7 +104,12 @@ def _make_runner(
         num_attention_heads=num_attention_heads,
     )
     runner = ModelRunner(
-        model, tokenizer=None, config=config, pool_size=pool_size, dtype=mx.float32
+        model,
+        tokenizer=None,
+        config=config,
+        pool_size=pool_size,
+        block_size=block_size,
+        dtype=mx.float32,
     )
     return runner, model
 
@@ -177,7 +180,7 @@ class TestRequestState:
             request_id="r1",
             prompt_tokens=[1, 2, 3],
             output_tokens=[4, 5],
-            all_slot_indices=[10, 11, 12, 13, 14],
+            all_block_indices=[10, 11, 12, 13, 14],
             radix_node=None,
             prefix_len=0,
             kv_caches=[],
@@ -189,7 +192,7 @@ class TestRequestState:
             request_id="r1",
             prompt_tokens=[1, 2, 3],
             output_tokens=[],
-            all_slot_indices=[10, 11, 12],
+            all_block_indices=[10, 11, 12],
             radix_node=None,
             prefix_len=0,
             kv_caches=[],
@@ -206,7 +209,7 @@ class TestForwardPrefill:
     def test_cold_start(self):
         """No prefix match — all tokens are new."""
         runner, model = _make_runner()
-        prompt = [10, 20, 30, 40]
+        prompt = list(range(BLOCK_SIZE))
 
         state, result = runner.forward_prefill("req-1", prompt)
 
@@ -215,37 +218,36 @@ class TestForwardPrefill:
         assert state.prompt_tokens == prompt
         assert state.output_tokens == []
         assert state.prefix_len == 0
-        assert len(state.all_slot_indices) == 4
+        assert len(state.all_block_indices) == BLOCK_SIZE
         assert len(state.kv_caches) == NUM_LAYERS
         assert model._call_count == 1
 
-    def test_slot_allocation(self):
-        """Slots are allocated from the pool and tracked in state."""
+    def test_block_allocation(self):
+        """Blocks are allocated from the pool and tracked in state."""
         runner, _ = _make_runner(pool_size=32)
-        prompt = [1, 2, 3, 4, 5]
+        prompt = list(range(BLOCK_SIZE + 1))
         avail_before = runner._allocator.available_size
 
         state, _ = runner.forward_prefill("req-1", prompt)
 
-        # 5 slots allocated
-        assert runner._allocator.available_size == avail_before - 5
-        # All slot indices are valid (>= 1)
-        assert all(s >= 1 for s in state.all_slot_indices)
+        # Nine tokens occupy two physical blocks.
+        assert runner._allocator.available_size == avail_before - 2
+        assert all(s >= 0 for s in state.all_block_indices)
 
     def test_radix_insert(self):
         """Prompt tokens are inserted into the radix cache after prefill."""
         runner, _ = _make_runner()
-        prompt = [10, 20, 30]
+        prompt = list(range(BLOCK_SIZE))
         runner.forward_prefill("req-1", prompt)
 
-        # Matching the same prefix should return the slots
+        # Matching the same prefix should return token-granular block IDs.
         match = runner._radix_cache.match_prefix(prompt)
-        assert len(match.device_indices) == 3
+        assert len(match.device_indices) == BLOCK_SIZE
 
     def test_radix_lock(self):
         """The radix node is locked after prefill."""
         runner, _ = _make_runner()
-        state, _ = runner.forward_prefill("req-1", [10, 20, 30])
+        state, _ = runner.forward_prefill("req-1", list(range(BLOCK_SIZE)))
 
         assert state.radix_node is not None
         assert state.radix_node.lock_ref > 0
@@ -259,7 +261,7 @@ class TestForwardPrefill:
     def test_full_cache_hit(self):
         """Full cache hit recomputes last token for logits."""
         runner, model = _make_runner()
-        prompt = [10, 20, 30]
+        prompt = list(range(BLOCK_SIZE))
 
         # First request inserts prompt into cache
         state1, _ = runner.forward_prefill("req-1", prompt)
@@ -270,7 +272,7 @@ class TestForwardPrefill:
 
         assert result.forward_mode == ForwardMode.PREFILL
         assert result.logits.shape == (VOCAB_SIZE,)
-        assert len(state2.all_slot_indices) == 3
+        assert len(state2.all_block_indices) == BLOCK_SIZE
         # Model was called twice total (once for each prefill)
         assert model._call_count == 2
 
@@ -282,23 +284,23 @@ class TestForwardDecode:
     """Tests for forward_decode."""
 
     def test_single_decode_step(self):
-        """One decode step allocates 1 slot and produces logits."""
+        """One decode step allocates a block at a page boundary."""
         runner, model = _make_runner()
-        state, _ = runner.forward_prefill("req-1", [10, 20, 30])
-        slots_before = len(state.all_slot_indices)
+        state, _ = runner.forward_prefill("req-1", list(range(BLOCK_SIZE)))
+        tokens_before = len(state.all_block_indices)
         avail_before = runner._allocator.available_size
 
         result = runner.forward_decode(state, token_id=42)
 
         assert result.forward_mode == ForwardMode.DECODE
         assert result.logits.shape == (VOCAB_SIZE,)
-        assert len(state.all_slot_indices) == slots_before + 1
+        assert len(state.all_block_indices) == tokens_before + 1
         assert runner._allocator.available_size == avail_before - 1
         assert state.output_tokens == [42]
         assert model._call_count == 2  # 1 prefill + 1 decode
 
     def test_multiple_decode_steps(self):
-        """Multiple decode steps accumulate tokens and slots."""
+        """Multiple decode steps accumulate tokens and block IDs."""
         runner, _ = _make_runner()
         state, _ = runner.forward_prefill("req-1", [10, 20])
 
@@ -306,18 +308,18 @@ class TestForwardDecode:
             runner.forward_decode(state, token_id)
 
         assert state.output_tokens == [30, 40, 50]
-        assert len(state.all_slot_indices) == 5  # 2 prompt + 3 decode
+        assert len(state.all_block_indices) == 5  # 2 prompt + 3 decode
         assert state.seq_len == 5
 
     def test_radix_insert_after_decode(self):
-        """Each decode step inserts the extended sequence into radix cache."""
+        """A completed page is inserted into radix cache."""
         runner, _ = _make_runner()
-        state, _ = runner.forward_prefill("req-1", [10, 20])
-        runner.forward_decode(state, token_id=30)
+        prompt = list(range(BLOCK_SIZE - 1))
+        state, _ = runner.forward_prefill("req-1", prompt)
+        runner.forward_decode(state, token_id=99)
 
-        # The cache should now have [10, 20, 30]
-        match = runner._radix_cache.match_prefix([10, 20, 30])
-        assert len(match.device_indices) == 3
+        match = runner._radix_cache.match_prefix(prompt + [99])
+        assert len(match.device_indices) == BLOCK_SIZE
 
     def test_kv_cache_offset_grows(self):
         """Each decode step should set offset = total cached tokens."""
@@ -341,7 +343,7 @@ class TestFinishRequest:
     def test_unlock(self):
         """Finishing a request unlocks the radix node."""
         runner, _ = _make_runner()
-        state, _ = runner.forward_prefill("req-1", [10, 20, 30])
+        state, _ = runner.forward_prefill("req-1", list(range(BLOCK_SIZE)))
         node = state.radix_node
         assert node.lock_ref > 0
 
@@ -357,16 +359,16 @@ class TestFinishRequest:
         runner.finish_request(state)
         assert "req-1" not in runner._active_requests
 
-    def test_slots_remain_in_radix(self):
-        """After finish, slots remain in the radix cache for future reuse."""
+    def test_blocks_remain_in_radix(self):
+        """After finish, committed full blocks remain reusable."""
         runner, _ = _make_runner()
-        prompt = [10, 20, 30]
+        prompt = list(range(BLOCK_SIZE))
         state, _ = runner.forward_prefill("req-1", prompt)
         runner.finish_request(state)
 
         # Prefix should still be matchable
         match = runner._radix_cache.match_prefix(prompt)
-        assert len(match.device_indices) == 3
+        assert len(match.device_indices) == BLOCK_SIZE
 
 
 # ---- TestGenerate ----
@@ -410,16 +412,15 @@ class TestGenerate:
 
         assert len(runner._active_requests) == 0
 
-    def test_slots_allocated_correctly(self):
-        """Total slots = prompt + generated tokens."""
+    def test_blocks_allocated_correctly(self):
+        """Blocks are allocated by page, not by token."""
         runner, _ = _make_runner(pool_size=100)
         avail_before = runner._allocator.available_size
 
         runner.generate([10, 20, 30], max_tokens=5)
 
-        # 3 prompt + 5 generated = 8 slots (in radix cache, not freed)
         used = avail_before - runner._allocator.available_size
-        assert used == 8
+        assert used == 1
 
 
 # ---- TestPrefixReuse ----
@@ -429,31 +430,26 @@ class TestPrefixReuse:
     """Tests for prefix reuse across requests."""
 
     def test_shared_prefix(self):
-        """Two requests sharing a prefix reuse radix cache slots."""
-        runner, model = _make_runner(pool_size=100)
+        """Two requests sharing a full block reuse radix cache blocks."""
+        runner, _ = _make_runner(pool_size=100)
 
-        # Request 1: prompt [10, 20, 30, 40, 50]
-        state1, _ = runner.forward_prefill("req-1", [10, 20, 30, 40, 50])
+        state1, _ = runner.forward_prefill("req-1", list(range(BLOCK_SIZE + 2)))
         runner.finish_request(state1)
 
         avail_before = runner._allocator.available_size
 
-        # Request 2: shares prefix [10, 20, 30], new tokens [60, 70]
-        state2, _ = runner.forward_prefill("req-2", [10, 20, 30, 60, 70])
+        state2, _ = runner.forward_prefill("req-2", list(range(BLOCK_SIZE)) + [60, 70])
 
-        # Should have matched 3 tokens from radix cache
-        assert state2.prefix_len == 3
-        # Only 2 new slots allocated (for tokens 60, 70)
-        assert runner._allocator.available_size == avail_before - 2
-        # Total slots = 3 (reused) + 2 (new) = 5
-        assert len(state2.all_slot_indices) == 5
+        assert state2.prefix_len == BLOCK_SIZE
+        assert runner._allocator.available_size == avail_before - 1
+        assert len(state2.all_block_indices) == BLOCK_SIZE + 2
 
         runner.finish_request(state2)
 
     def test_full_prefix_reuse(self):
         """Second request with identical prompt reuses everything."""
         runner, _ = _make_runner()
-        prompt = [10, 20, 30]
+        prompt = list(range(BLOCK_SIZE))
 
         state1, _ = runner.forward_prefill("req-1", prompt)
         runner.finish_request(state1)
@@ -461,9 +457,9 @@ class TestPrefixReuse:
         avail_before = runner._allocator.available_size
         state2, _ = runner.forward_prefill("req-2", prompt)
 
-        # Full hit: no new slots allocated (last token reuses existing slot)
-        assert runner._allocator.available_size == avail_before
-        assert len(state2.all_slot_indices) == 3
+        # Full hit recomputes the last page transiently for logits.
+        assert runner._allocator.available_size == avail_before - 1
+        assert len(state2.all_block_indices) == BLOCK_SIZE
 
         runner.finish_request(state2)
 
@@ -472,34 +468,32 @@ class TestPrefixReuse:
         runner, _ = _make_runner(pool_size=100)
 
         # Request 1: prefill + decode
-        state1, _ = runner.forward_prefill("req-1", [10, 20, 30])
+        state1, _ = runner.forward_prefill("req-1", list(range(BLOCK_SIZE)))
         runner.forward_decode(state1, 40)
         runner.forward_decode(state1, 50)
         runner.finish_request(state1)
 
         # Request 2: same prefix, different suffix
-        state2, _ = runner.forward_prefill("req-2", [10, 20, 30, 60])
+        state2, _ = runner.forward_prefill("req-2", list(range(BLOCK_SIZE)) + [60])
 
-        # Should reuse [10, 20, 30] from cache
-        assert state2.prefix_len == 3
-        assert len(state2.all_slot_indices) == 4
+        assert state2.prefix_len == BLOCK_SIZE
+        assert len(state2.all_block_indices) == BLOCK_SIZE + 1
 
         runner.finish_request(state2)
 
-    def test_no_slot_leaks(self):
-        """Multiple generate calls don't leak pool slots."""
+    def test_no_block_leaks(self):
+        """Eviction can reclaim committed blocks."""
         runner, _ = _make_runner(pool_size=200)
         avail_start = runner._allocator.available_size
 
-        # Run two generate calls
-        runner.generate([1, 2, 3], max_tokens=2)  # 3 + 2 = 5 slots
-        runner.generate([4, 5, 6], max_tokens=2)  # 3 + 2 = 5 slots
+        # Run two generate calls that never complete a full page.
+        runner.generate([1, 2, 3], max_tokens=2)
+        runner.generate([4, 5, 6], max_tokens=2)
 
-        # Slots are in the radix cache, not freed
         used = avail_start - runner._allocator.available_size
-        assert used == 10
+        assert used == 0
 
-        # But eviction can reclaim them
+        # Partial blocks were not committed, so eviction is a no-op here.
         runner._radix_cache.evict(
             __import__(
                 "sglang_mlx.srt.mem_cache.base_prefix_cache", fromlist=["EvictParams"]

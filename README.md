@@ -47,8 +47,8 @@ threadgroup-memory requirements before dispatch.
 │  │    ModelRunner        │    │    mlx-lm Model Zoo               │  │
 │  │                       │    │                                   │  │
 │  │  Manages forward      │    │  Llama · Qwen · Mistral · Gemma   │  │
-│  │  passes with batched  │◄── │  Phi · DeepSeek · Cohere · ...    │  │
-│  │  PooledKVCache        │    │                                   │  │
+│  │  passes with paged    │◄── │  Phi · DeepSeek · Cohere · ...    │  │
+│  │  KV cache blocks      │    │                                   │  │
 │  │                       │    │  Weight loading · Sampling        │  │
 │  └──────────┬────────────┘    └───────────────────────────────────┘  │
 │             │                                                        │
@@ -58,24 +58,24 @@ threadgroup-memory requirements before dispatch.
 │  ┌────────────────────┐  ┌────────────────┐  ┌───────────────────┐   │
 │  │  Radix Prefix      │  │  KV Pool       │  │  Eviction         │   │
 │  │  Cache             │  │                │  │  Policies         │   │
-│  │                    │  │ Slot Allocator │  │                   │   │
+│  │                    │  │ Block Allocator│  │                   │   │
 │  │  Tree-based prefix │  │  (free list)   │  │  LRU · LFU        │   │
 │  │  sharing across    │  │                │  │  FIFO · Priority  │   │
-│  │  requests          │  │  MHATokenPool  │  │                   │   │
+│  │  requests          │  │  PagedMHAPool  │  │                   │   │
 │  │                    │  │  (MLX arrays)  │  │                   │   │
 │  └────────────────────┘  └────────────────┘  └───────────────────┘   │
 │                                                                      │
 ├──────────────────────────────────────────────────────────────────────┤
 │                         MLX Runtime                                  │
 │                                                                      │
-│    mx.fast.scaled_dot_product_attention · mx.compile                 │
+│    Paged attention Metal kernels · mx.compile                        │
 │    Lazy Evaluation · Unified Memory Arrays · mx.stream               │
 │                                                                      │
 ├──────────────────────────────────────────────────────────────────────┤
 │                    Apple Silicon Hardware                            │
 │                                                                      │
 │           GPU Cores · Neural Engine · Unified Memory                 │
-│                  No paged attention needed                           │
+│                  Unified memory + block KV reuse                     │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -84,8 +84,8 @@ threadgroup-memory requirements before dispatch.
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| No paged attention | Simple slot allocator | Unified memory = OS handles paging. No fragmentation problem. |
+| Paged KV cache | Block allocator + Metal paged attention | Prefix reuse stays block-addressable and avoids gather copies. |
 | No PyTorch | Pure MLX + Python | Zero interop overhead. MLX lazy eval handles everything. |
 | Single process | Async event loop | Unified memory = no CPU↔GPU transfers = no need for separate GPU process. |
 | mlx-lm models | Hybrid integration | 100+ architectures for free. Only replace KV cache interface. |
-| PooledKVCache | Adapter pattern | Thin wrapper over MHATokenPool. Models unchanged. |
+| PagedKVCache | Adapter pattern | Per-request view over shared PagedMHAPool blocks. |

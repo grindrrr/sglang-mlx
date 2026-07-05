@@ -22,6 +22,9 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from sglang_mlx.srt.mem_cache.paged_pool import BlockAllocator
+
 from sglang_mlx.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -44,7 +47,7 @@ from sglang_mlx.srt.mem_cache.evict_policy import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang_mlx.srt.mem_cache.memory_pool import TokenPoolAllocator
+    from sglang_mlx.srt.mem_cache.paged_pool import BlockAllocator
 
 
 class TreeNode:
@@ -113,7 +116,7 @@ class RadixCache(BasePrefixCache):
         else:
             raise ValueError(f"Unknown eviction policy: {self.eviction_policy}")
 
-        self.allocator: TokenPoolAllocator | None = None
+        self.allocator: BlockAllocator | None = None
         self.evictable_leaves: set[TreeNode] = set()
         self.reset()
 
@@ -126,8 +129,8 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self.evictable_leaves.clear()
 
-    def set_allocator(self, allocator: TokenPoolAllocator) -> None:
-        """Attach a pool allocator so eviction frees slots back to it."""
+    def set_allocator(self, allocator: BlockAllocator) -> None:
+        """Attach a pool allocator so eviction releases committed blocks."""
         self.allocator = allocator
 
     ##### Public API #####
@@ -288,7 +291,17 @@ class RadixCache(BasePrefixCache):
         child.key = child.key[split_len:]
         child.value = child.value[split_len:]  # slice indices
 
+        if self.allocator is not None:
+            # The original node owned one reference for each unique block in
+            # child.value before the split. After splitting, only blocks that
+            # appear on both sides need an extra reference for the new parent.
+            overlap = list(set(new_node.value or []) & set(child.value or []))
+            if overlap:
+                self.allocator.retain(overlap)
+
         new_node.parent.children[key[0]] = new_node
+        self._update_leaf_status(child)
+        self._update_leaf_status(new_node)
         return new_node
 
     def _insert_helper(
@@ -331,6 +344,8 @@ class RadixCache(BasePrefixCache):
             new_node.key = list(key)  # copy
             new_node.value = list(value)  # copy
             node.children[child_key] = new_node
+            if self.allocator is not None:
+                self.allocator.retain(new_node.value)
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
